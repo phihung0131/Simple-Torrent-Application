@@ -4,7 +4,7 @@ A distributed file sharing system built with a tracker server and peer nodes, en
 
 ## Preview
 
-🎥 [Watch Demo Video](https://youtu.be/cTxnDhX-uRk)
+[![Project Demo](https://img.youtube.com/vi/cTxnDhX-uRk/0.jpg)](https://youtu.be/cTxnDhX-uRk)
 
 ## 📁 Project Structure
 
