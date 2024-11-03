@@ -2,7 +2,7 @@
 
 A distributed file sharing system built with a tracker server and peer nodes, enabling efficient file sharing and downloading among users.
 
-## Preview
+## 🚀 Video Preview
 
 [![Project Demo](https://img.youtube.com/vi/cTxnDhX-uRk/0.jpg)](https://youtu.be/cTxnDhX-uRk)
 
