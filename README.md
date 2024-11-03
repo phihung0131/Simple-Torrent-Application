@@ -13,6 +13,20 @@ The project consists of two main components:
 1. **Tracker**: A central server that manages file sharing metadata and coordinates peer connections.
 2. **Node**: Peer nodes that share, download, and manage files, each with a GUI for easy interaction.
 
+```plaintext
+├── node/               # Peer node implementation
+│   ├── node_data/      # Storage for downloaded files and file pieces
+│   ├── gui.py          # User interface for file sharing and downloading
+│   └── node.py         # Core node functionality
+└── tracker/            # Central tracker server
+    ├── src/            # Source code
+    │   ├── config/     # Configuration files
+    │   ├── controller/ # Handles requests and responses
+    │   ├── model/      # Database models
+    │   └── route/      # API route definitions
+    └── app.js          # Server entry point
+```
+
 ### Tracker Component
 
 Located in the `/tracker` directory:
@@ -100,22 +114,6 @@ Listed in `requirements.txt`, including:
 
 - **Python GUI libraries**: For creating the graphical user interface.
 - **Network communication libraries**: To enable peer-to-peer communication.
-
-## 📂 Project Structure
-
-```plaintext
-├── node/               # Peer node implementation
-│   ├── node_data/      # Storage for downloaded files and file pieces
-│   ├── gui.py          # User interface for file sharing and downloading
-│   └── node.py         # Core node functionality
-└── tracker/            # Central tracker server
-    ├── src/            # Source code
-    │   ├── config/     # Configuration files
-    │   ├── controller/ # Handles requests and responses
-    │   ├── model/      # Database models
-    │   └── route/      # API route definitions
-    └── app.js          # Server entry point
-```
 
 ## 📝 Usage
 
