@@ -1,23 +1,293 @@
-import threading
-import socket
-import bencodepy
-import hashlib
-import time
-import requests
-import os
-import json
-import math
-from peer_connection import PeerConnection
-from download_manager import DownloadManager
+import threading, socket, os, json, math, base64, hashlib, requests, bencodepy, traceback, time
 from config import tracker_host
-import base64
+
+class PeerConnection(threading.Thread):
+    MESSAGE_END = "\n"
+
+    def __init__(self, node, peer_address, assigned_pieces=None, is_initiator=True):
+        super().__init__()
+        self.node = node
+        self.peer_address = peer_address 
+        self.is_initiator = is_initiator
+        self.assigned_pieces = assigned_pieces or []
+        self.sock = None
+        self.running = True
+        self.message_queue = []
+        self.queue_lock = threading.Lock()
+        self.buffer = ""
+        self.role = "Leecher" if is_initiator else "Seeder"
+
+    def run(self):
+        try:
+            self._setup_connection()
+            self.handle_connection()
+        except Exception as e:
+            print(f"{self.role}: Connection error: {e}")
+        finally:
+            self.cleanup()
+
+    def _setup_connection(self):
+        if self.is_initiator:
+            self._connect_as_leecher() 
+        else:
+            self._listen_as_seeder()
+
+    def _connect_as_leecher(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"{self.role}: Connecting to {self.peer_address[0]}:{self.peer_address[1]}")
+        self.sock.connect(self.peer_address)
+        print(f"{self.role}: Connected successfully")
+
+    def _listen_as_seeder(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) 
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('0.0.0.0', self.node.port))
+        server_socket.listen(1)
+        print(f"{self.role}: Listening on port {self.node.port}")
+        
+        self.sock, client_address = server_socket.accept()
+        print(f"{self.role}: Accepted connection from {client_address[0]}:{client_address[1]}")
+        server_socket.close()
+
+    def handle_connection(self):
+        receive_thread = threading.Thread(target=self._receive_messages)
+        send_thread = threading.Thread(target=self._process_message_queue)
+        receive_thread.daemon = True
+        send_thread.daemon = True
+        
+        receive_thread.start()
+        send_thread.start()
+
+        if self.is_initiator:
+            self.queue_message({"type": "HELLO"})
+
+        while self.running and receive_thread.is_alive() and send_thread.is_alive():
+            threading.Event().wait(1)
+
+    def _process_message_queue(self):
+        print(f"{self.role}: Message sending thread started")
+        while self.running:
+            try:
+                with self.queue_lock:
+                    if self.message_queue:
+                        message = self.message_queue.pop(0)
+                        self._send_message(message)
+                threading.Event().wait(0.1)
+            except Exception as e:
+                print(f"{self.role}: Message queue error: {e}")
+                break
+        print(f"{self.role}: Message sending thread ended")
+
+    def _send_message(self, message_dict):
+        try:
+            message = json.dumps(message_dict) + self.MESSAGE_END
+            log_message = {k: '<binary data>' if k == 'data' else v 
+                         for k, v in message_dict.items()}
+            print(f"{self.role}: Sending message: {json.dumps(log_message)}")
+            
+            self.sock.sendall(message.encode('utf-8'))
+            print(f"{self.role}: Message sent successfully")
+        except Exception as e:
+            print(f"Message sending error: {e}")
+            raise
+
+    def _receive_messages(self):
+        print(f"{self.role}: Listen thread started")
+        while self.running:
+            try:
+                if not self.sock:
+                    break
+
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+
+                self.buffer += data.decode('utf-8')
+                while self.MESSAGE_END in self.buffer:
+                    message, self.buffer = self.buffer.split(self.MESSAGE_END, 1)
+                    if message:
+                        self._handle_received_message(message)
+
+            except Exception as e:
+                print(f"{self.role}: Receive error: {e}")
+                break
+        print(f"{self.role}: Listen thread ended")
+
+    def _handle_received_message(self, message):
+        message_dict = json.loads(message)
+        log_message = {k: '<binary data>' if k == 'data' else v 
+                      for k, v in message_dict.items()}
+        print(f"{self.role}: Received message: {json.dumps(log_message)}")
+        self._handle_message_type(message_dict)
+
+    def _handle_message_type(self, message):
+        handlers = {
+            "HELLO": self._handle_hello,
+            "HELLO_ACK": self._handle_hello_ack,
+            "REQUEST_PIECE": self._handle_request_piece,
+            "PIECE_DATA": self._handle_piece_data
+        }
+        handler = handlers.get(message.get('type'))
+        if handler:
+            handler(message)
+
+    def _handle_hello(self, _):
+        if not self.is_initiator:
+            self.queue_message({"type": "HELLO_ACK"})
+    
+    def _handle_hello_ack(self, _):
+        if self.is_initiator:
+            self.request_pieces()
+            
+    def _handle_request_piece(self, message):
+        if not self.is_initiator:
+            piece_data = self.node.get_piece_data(
+                message['magnet_link'], 
+                message['piece_index']
+            )
+            if piece_data:
+                self.queue_message({
+                    "type": "PIECE_DATA",
+                    "piece_index": message['piece_index'],
+                    "data": base64.b64encode(piece_data).decode()
+                })
+
+    def _handle_piece_data(self, message):
+        if self.is_initiator:
+            piece_data = base64.b64decode(message['data'])
+            self.node.handle_received_piece(
+                message['piece_index'],
+                piece_data
+            )
+
+    def request_pieces(self):
+        for piece_index in self.assigned_pieces:
+            if piece_index in self.node.get_needed_pieces():
+                self.queue_message({
+                    "type": "REQUEST_PIECE",
+                    "piece_index": piece_index,
+                    "magnet_link": self.node.current_magnet_link
+                })
+
+    def queue_message(self, message_dict):
+        with self.queue_lock:
+            self.message_queue.append(message_dict)
+
+    def start_listening(self):
+        """Start a new seeder connection to listen for incoming peers"""
+        try:
+            listener = PeerConnection(self, ('0.0.0.0', self.port), is_initiator=False)
+            self.peer_connections.append(listener)
+            listener.start()
+            print(f"Started new listener on port {self.port}")
+        except Exception as e:
+            print(f"Error starting listener: {e}")
+
+    def cleanup(self):
+        """Clean up connection and restart listening if seeder"""
+        try:
+            self.running = False
+            if self.sock:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
+                self.sock.close()
+                self.sock = None
+
+            # Restart listening if this was a seeder connection
+            if not self.is_initiator:
+                print(f"{self.role}: Restarting listening state...")
+                try:
+                    # Remove self from node's peer connections if present
+                    if self in self.node.peer_connections:
+                        self.node.peer_connections.remove(self)
+                    # Start new listener
+                    self.node.start_listening()
+                except Exception as e:
+                    print(f"{self.role}: Error restarting listener: {e}")
+        except Exception as e:
+            print(f"{self.role}: Cleanup error: {e}")
+
+class DownloadManager(threading.Thread):
+    def __init__(self, node):
+        threading.Thread.__init__(self)
+        self.node = node
+        self.downloads = {}  # {magnet_link: download_info}
+    
+    def run(self):
+        while self.node.running: 
+            # Kiểm tra các file đang tải
+            for magnet_link, download_info in list(self.downloads.items()):
+                if all(download_info['pieces']):
+                    self.finish_download(magnet_link, download_info)
+                else:
+                    self.request_next_piece(magnet_link, download_info)
+            
+            # Đợi một khoảng thời gian trước khi kiểm tra lại
+            threading.Event().wait(5)
+
+    def finish_download(self, magnet_link, download_info):
+        """Hoàn thành quá trình tải"""
+        try:
+            # Ghép các piece thành file hoàn chỉnh
+            self.combine_pieces(magnet_link, download_info)
+            print(f"Đã tải xong file: {download_info['file_name']}")
+            
+            # Ngắt tất cả các kết nối đang hoạt động cho download này
+            for conn in download_info['connections']:
+                try:
+                    conn.cleanup()
+                except Exception as e:
+                    print(f"Lỗi khi ngắt kết nối: {e}")
+            download_info['connections'].clear()
+            
+            # Ngắt kết nối với tất cả peer từ node
+            self.node.disconnect_all_peers()         
+            
+        except Exception as e:
+            print(f"Lỗi khi hoàn thành tải file: {e}")
+        finally:
+            # Xóa thông tin download
+            if magnet_link in self.downloads:
+                del self.downloads[magnet_link]
+                if all(download_info['pieces']):
+                    self.node.start_listening()
+                # Yêu cầu lại piece không hợp lệ
+
+    def piece_completed(self, magnet_link, piece_index):
+        """Xử lý khi một piece được tải xong"""
+        download_info = self.downloads.get(magnet_link)
+        if download_info:
+            # Cập nhật trạng thái
+            download_info['active_pieces'].remove(piece_index)
+            download_info['completed_pieces'].add(piece_index)
+            
+            # Kiểm tra nếu tải xong
+            if len(download_info['completed_pieces']) == len(download_info['peers_data']['pieces']):
+                self.finish_download(magnet_link, download_info)
+            else:
+                # Tiếp tục tải các piece khác
+                download_info = self.downloads[magnet_link]
+                pieces_info = download_info['peers_data']['pieces']
+                
+                # Chọn các cặp piece-peer 
+                selected_pairs = [(piece['piece_index'], piece['nodes'][0]) for piece in pieces_info if piece['nodes']]
+                
+                for piece_index, peer in selected_pairs:
+                    if piece_index not in download_info['active_pieces']:
+                        # Tạo kết nối mới và yêu cầu piece
+                        peer_conn = self.node.connect_and_request_piece(peer, piece_index)
+                        if peer_conn:
+                            download_info['connections'].add(peer_conn)
+                            download_info['active_pieces'].add(piece_index)
+                            download_info['piece_sources'][piece_index] = peer
 
 class Node:
     def __init__(self):
-        # Thêm vào đầu __init__
         self.running = True
-        self.config_file = 'node_config.json'
-        self.load_or_create_config()
+        self.ip = self.get_ip()
+        self.port = 52229
         self.peers = []
         self.tracker_url = f"{tracker_host}/api/nodes"
         self.file_share_url = f"{tracker_host}/api/files"
@@ -32,7 +302,7 @@ class Node:
         os.makedirs(self.pieces_dir, exist_ok=True)
         os.makedirs(self.downloads_dir, exist_ok=True)
         self.current_magnet_link = None
-        self.current_file_name = None  # Thêm dòng này
+        self.current_file_name = None 
         self.shared_files = {}  # Lưu mapping giữa magnet link và thông tin file
         self.shared_files_path = os.path.join(self.node_data_dir, 'shared_files.json')
         self.load_shared_files()  # Load thông tin shared files khi khởi động
@@ -40,21 +310,6 @@ class Node:
 
     def stop(self):
         self.running = False
-
-    def load_or_create_config(self):
-        if os.path.exists(self.config_file):
-            with open(self.config_file, 'r') as f:
-                config = json.load(f)
-            # Luôn cập nhật IP và sử dụng port 52229
-            self.ip = self.get_ip()
-            self.port = 52229
-        else:
-            self.ip = self.get_ip()
-            self.port = 52229
-        
-        # Lưu cấu hnh
-        with open(self.config_file, 'w') as f:
-            json.dump({'ip': self.ip, 'port': self.port}, f)
 
     def get_ip(self):
         try:
@@ -69,8 +324,6 @@ class Node:
             return "127.0.0.1"
 
     def run(self):
-        print("======================VVVVVVVVV=========================")
-        print(f"Node đang chạy trên IP: {self.ip}, Port: {self.port}")
         # Thông báo lần đầu đến tracker
         initial_response = self.announce_to_tracker()
         if initial_response:
@@ -99,7 +352,7 @@ class Node:
     def periodic_announce(self):
         while self.running:  # Thay vì while True
             self.announce_to_tracker()
-            time.sleep(120)  # Đợi 2 phút
+            time.sleep(300)  # Đợi 5 phút
 
     def share_file(self, file_path, callback=None):
         """Chia sẻ file với mạng ngang hàng"""
@@ -206,7 +459,7 @@ class Node:
             "magnet_text": magnet_link
         }
         try:
-            url = f"{self.file_share_url}/peers"  # Đảm bảo endpoint đúng
+            url = f"{self.file_share_url}/peers" 
             response = requests.post(url, json=data)
             if response.status_code == 200:
                 data = response.json()
@@ -255,32 +508,6 @@ class Node:
     def start_listening(self):
         listener = PeerConnection(self, ('0.0.0.0', self.port), is_initiator=False)
         listener.start()
-
-    def find_peer_with_piece(self, peers_data, piece_index):
-        """Tìm peer có piece cần thiết"""
-        try:
-            if isinstance(peers_data, dict) and 'pieces' in peers_data:
-                pieces = peers_data['pieces']
-                print(f"Tìm kiếm piece {piece_index} trong danh sách: {pieces}")  # Debug log
-                
-                # Tìm piece theo index
-                for piece in pieces:
-                    if piece.get('piece_index') == piece_index:
-                        nodes = piece.get('nodes', [])
-                        if nodes:
-                            print(f"Tìm thấy peer cho piece {piece_index}: {nodes[0]}")
-                            return nodes[0]
-                
-                print(f"Không tìm thấy peer nào có piece {piece_index}")
-                print(f"Cấu trúc pieces: {pieces}")
-            else:
-                print("Dữ liệu peers không đúng định dạng")
-                print(f"Peers data: {peers_data}")
-        except Exception as e:
-            print(f"Lỗi khi tìm peer: {e}")
-            print(f"Peers data: {peers_data}")
-            print(f"Chi tiết lỗi: {traceback.format_exc()}")
-        return None
 
     def connect_and_request_pieces(self, peers_data):
         """Tạo nhiều kết nối và phân phối pieces"""
@@ -495,23 +722,10 @@ class Node:
             self.download_manager.piece_completed(self.current_magnet_link, piece_index)
             
             # Kiểm tra nếu đã tải xong
-            if self.check_download_complete():
-                self.finish_download()
+            self.finish_download()
         else:
             print(f"Piece {piece_index} không hợp lệ")
             self.download_manager.piece_failed(self.current_magnet_link, piece_index)
-
-    def check_download_complete(self):
-        """Kiểm tra xem đã tải đủ các piece chưa"""
-        piece_dir = os.path.join(self.pieces_dir, self.current_file_name)
-        if not os.path.exists(piece_dir):
-            return False
-            
-        torrent_info = self.get_decoded_torrent_info()
-        total_pieces = len(torrent_info['pieces'])
-        
-        existing_pieces = [f for f in os.listdir(piece_dir) if f.startswith('piece_')]
-        return len(existing_pieces) == total_pieces
 
     def get_needed_pieces(self):
         """Lấy danh sách các piece còn thiếu"""
@@ -549,49 +763,44 @@ class Node:
             print(f"Lỗi khi lưu shared files: {e}")
 
     def finish_download(self):
+        """Kiểm tra xem đã tải đủ các piece chưa"""
+        piece_dir = os.path.join(self.pieces_dir, self.current_file_name)
+        if not os.path.exists(piece_dir):
+            return False
+            
+        torrent_info = self.get_decoded_torrent_info()
+        total_pieces = len(torrent_info['pieces'])
+        
+        existing_pieces = [f for f in os.listdir(piece_dir) if f.startswith('piece_')]
+
         """Xử lý khi tải file hoàn tất"""
-        try:
-            # Ghép các piece thành file hoàn chỉnh
-            self.combine_pieces()
-            
-            # Ngắt kết nối với tất cả peer
-            for peer_conn in self.peer_connections:
-                peer_conn.cleanup()
+        if len(existing_pieces) == total_pieces:
+            try:
+                # Ghép các piece thành file hoàn chỉnh
+                self.combine_pieces()
                 
-            
-            print(f"Đã tải xong file: {self.current_file_name}")
-            
-            # Cập nhật trạng thái
-            self.current_file_name = None
-            self.current_magnet_link = None
-            self.peer_connections = []
-            
-        except Exception as e:
-            print(f"Lỗi khi hoàn thành tải file: {e}")
+                # Ngắt kết nối với tất cả peer
+                for peer_conn in self.peer_connections:
+                    peer_conn.cleanup()
+                    
+                
+                print(f"Đã tải xong file: {self.current_file_name}")
+                
+                # Cập nhật trạng thái
+                self.current_file_name = None
+                self.current_magnet_link = None
+                self.peer_connections = []
+                
+            except Exception as e:
+                print(f"Lỗi khi hoàn thành tải file: {e}")
 
     def disconnect_all_peers(self):
         """Ngắt tất cả các kết nối peer"""
-        print("Đang ngắt kết nối với tất cả các peer...")
-        # Tạo bản sao để tránh lỗi khi xóa trong vòng lặp
         for peer_conn in list(self.peer_connections):
             try:
                 peer_conn.cleanup()
-                peer_conn.join(timeout=1)  # Chờ thread kết thúc với timeout
-                self.peer_connections.remove(peer_conn)
+                peer_conn.join(timeout=1)
+                self.peer_connections.remove(peer_conn) 
             except Exception as e:
-                print(f"Lỗi khi ngắt kết nối peer: {e}")
-        
-        self.peer_connections.clear()  # Đảm bảo danh sách trốngg
-        print("Đã ngắt kết nối với tất cả các peer")
-
-
-
-
-
-
-
-
-
-
-
-
+                print(f"Lỗi khi ngắt kết nối: {e}")
+        self.peer_connections.clear()
